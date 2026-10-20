@@ -1,0 +1,101 @@
+name: Build Lucky Block (NeoForge 1.21.1)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # If the repository contains only a ZIP, extract it before Gradle setup.
+      - name: Find or extract the NeoForge Gradle project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          find_gradle_projects() {
+            find "$1" -type d \( -name .git -o -name .gradle -o -name build -o -name .ci-unpacked \) -prune -o \
+              -type f \( -name build.gradle -o -name build.gradle.kts \) -print | sort
+          }
+
+          candidates=()
+          # Prefer a direct repository-root project only if it is the NeoForge ModDevGradle project.
+          if [[ -f build.gradle ]] && grep -q 'net.neoforged.moddev' build.gradle; then
+            candidates=(build.gradle)
+          elif [[ -f build.gradle.kts ]] && grep -q 'net.neoforged.moddev' build.gradle.kts; then
+            candidates=(build.gradle.kts)
+          else
+            while IFS= read -r f; do
+              if grep -q 'net.neoforged.moddev' "$f"; then candidates+=("$f"); fi
+            done < <(find_gradle_projects .)
+          fi
+
+          if (( ${#candidates[@]} == 0 )); then
+            archive=''
+            preferred='./luckyblockmod-neoforge-1.21.1.zip'
+            if [[ -f "$preferred" ]] && unzip -Z1 "$preferred" | grep -E '(^|/)build\.gradle$' >/dev/null; then
+              archive="$preferred"
+            else
+              while IFS= read -r -d '' candidate; do
+                if unzip -Z1 "$candidate" | grep -E '(^|/)build\.gradle$' >/dev/null; then
+                  archive="$candidate"
+                  break
+                fi
+              done < <(find . -path './.git' -prune -o -path './.ci-unpacked' -prune -o -type f -iname '*.zip' -print0 | sort -z)
+            fi
+            if [[ -z "$archive" ]]; then
+              echo 'ERROR: No NeoForge ModDevGradle project found. Upload the extracted source or luckyblockmod-neoforge-1.21.1.zip.'
+              find . -path './.git' -prune -o -type f -print | sort | head -160
+              exit 1
+            fi
+            mkdir -p .ci-unpacked
+            dest=".ci-unpacked/$(basename "${archive%.*}")"
+            rm -rf "$dest" && mkdir -p "$dest"
+            echo "Extracting $archive into $dest"
+            unzip -oq "$archive" -d "$dest"
+            while IFS= read -r f; do
+              if grep -q 'net.neoforged.moddev' "$f"; then candidates+=("$f"); fi
+            done < <(find_gradle_projects "$dest")
+          fi
+
+          if (( ${#candidates[@]} == 0 )); then
+            echo 'ERROR: Found Gradle files, but none uses the NeoForge ModDevGradle plugin.'
+            exit 1
+          fi
+          build_file="${candidates[0]}"
+          project_dir="$(dirname "$build_file")"
+          project_dir="${project_dir#./}"
+          [[ "$project_dir" == "$build_file" ]] && project_dir='.'
+          test -f "$project_dir/settings.gradle" || test -f "$project_dir/settings.gradle.kts" || { echo "ERROR: No settings.gradle in $project_dir"; exit 1; }
+          test -d "$project_dir/src/main/java" || { echo "ERROR: No src/main/java in $project_dir"; exit 1; }
+          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "NeoForge project: $project_dir"
+
+      - name: Set up Gradle 9.2.1
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.2.1'
+
+      - name: Build mod
+        run: gradle --no-daemon --stacktrace -p "${{ steps.project.outputs.dir }}" clean build
+
+      - name: Upload mod JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: luckyblockmod-neoforge-1.21.1
+          path: ${{ steps.project.outputs.dir }}/build/libs/*.jar
+          if-no-files-found: error
